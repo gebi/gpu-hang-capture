@@ -1,0 +1,23 @@
+[Unit]
+Description=Capture i915 GPU hang error state before it is lost
+After=systemd-journald.service
+
+[Service]
+ExecStart=/usr/local/sbin/gpu-hang-capture
+Restart=always
+RestartSec=5
+# keep running even if the system is under memory pressure during a hang
+OOMScoreAdjust=-900
+Nice=-5
+# hardening: needs root for debugfs and /sys/class/drm/*/error, but nothing
+# else should be writable. Not ProtectKernelTunables/ProtectKernelLogs: those
+# would make /sys read-only and hide dmesg, which this service needs.
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes
+LogsDirectory=gpu-hang
+LogsDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

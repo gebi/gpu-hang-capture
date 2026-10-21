@@ -1,0 +1,120 @@
+#!/bin/bash
+# Watch the kernel log for i915 GPU hangs and save the error state + context
+# before it is lost on reboot. Must run as root (reads debugfs, clears error).
+# See DESIGN.md for the reasoning behind the choices made here.
+#
+# Usage: gpu-hang-capture          # watch forever
+#        gpu-hang-capture --test   # capture once right now and exit
+
+set -u
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+# captures contain the journal and process list of all users: root-only
+umask 077
+
+OUTDIR=${OUTDIR:-/var/log/gpu-hang}
+TRIGGER='GPU HANG|GPU error state saved|device wedged|Failed to reset|timed out waiting for forcewake ack'
+DEBOUNCE=120    # seconds; one hang produces dozens of matching lines
+KEEP=20         # number of capture directories to keep
+MAXSIZE=64M     # per copied file; the i915 error state is usually a few MB
+
+log() { echo "gpu-hang-capture: $*"; logger -t gpu-hang-capture -- "$*" 2>/dev/null || true; }
+
+# copy a file, but never block forever on a wedged device or read without bound
+grab() {
+	local src=$1 dst=$2
+	[ -e "$src" ] || return 0
+	timeout 15 head -c "$MAXSIZE" "$src" > "$dst" 2>&1 || echo "(read failed/timed out: $?)" >> "$dst"
+}
+
+# copy a file that may live in a user-controlled location: read it with the
+# permissions of the file's owner, so a symlink can't make us leak root-only files
+grab_as_owner() {
+	local src=$1 dst=$2 uid gid
+	[ -e "$src" ] || return 0
+	uid=$(stat -c %u -- "$src") gid=$(stat -c %g -- "$src") || return 0
+	timeout 15 setpriv --reuid="$uid" --regid="$gid" --clear-groups -- \
+		head -c "$MAXSIZE" -- "$src" > "$dst" 2>&1 || echo "(read failed/timed out: $?)" >> "$dst"
+}
+
+prune() {
+	local dirs=("$OUTDIR"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9])
+	local n=$(( ${#dirs[@]} - KEEP )) i
+	for (( i = 0; i < n; i++ )); do
+		[ -d "${dirs[i]}" ] && rm -rf -- "${dirs[i]}"
+	done
+}
+
+capture() {
+	local reason=$1 dir card name dbg x
+	dir=$OUTDIR/$(date +%F_%H%M%S)
+	mkdir -- "$dir" || { log "cannot create $dir"; return 1; }
+	log "trigger: $reason -> capturing to $dir"
+	printf '%s\n' "$reason" > "$dir/trigger.txt"
+
+	# give i915 a moment to finish writing the error state after "GPU HANG"
+	sleep 3
+
+	for card in /sys/class/drm/card[0-9]; do
+		[ -e "$card/error" ] || continue
+		name=$(basename "$card")
+		grab "$card/error" "$dir/$name-error.txt"
+		# i915 only keeps the FIRST error until cleared; clear it so the
+		# next hang is recorded too
+		if [ -s "$dir/$name-error.txt" ] && ! grep -q '^No error state collected' "$dir/$name-error.txt"; then
+			echo 1 > "$card/error" 2>/dev/null || true
+		fi
+	done
+
+	# debugfs has the same device under dri/0, dri/128 (render node) and
+	# dri/<pci-addr>; use the pci-addr one only
+	for card in /sys/class/drm/card[0-9]; do
+		dbg=/sys/kernel/debug/dri/$(basename "$(readlink -f "$card/device")")
+		[ -d "$dbg" ] || dbg=/sys/kernel/debug/dri/${card##*card}
+		[ -d "$dbg" ] || continue
+		name=$(basename "$card")
+		grab "$dbg/i915_engine_info"    "$dir/$name-engine_info.txt"
+		grab "$dbg/gt0/forcewake"       "$dir/$name-forcewake.txt"
+		grab "$dbg/gt0/uc/guc_info"     "$dir/$name-guc_info.txt"
+		grab "$dbg/gt0/uc/huc_info"     "$dir/$name-huc_info.txt"
+		grab "$dbg/gt0/uc/guc_log_dump" "$dir/$name-guc_log.txt"
+	done
+
+	dmesg -T > "$dir/dmesg.txt" 2>&1
+	journalctl -b --since -15min --no-pager > "$dir/journal.txt" 2>&1
+	{ uname -a; echo; cat /proc/cmdline; echo; lspci -nnk -s 00:02.0
+	  echo; dpkg -l 'firmware-*' 'xserver-xorg*' 'libgl1-mesa*' 'mesa-*' 2>/dev/null | grep ^ii
+	  echo; cat /sys/class/dmi/id/bios_version /sys/class/dmi/id/bios_date 2>/dev/null
+	  echo; ps -eo pid,user,etime,args --sort=-pcpu | head -40
+	} > "$dir/system.txt" 2>&1
+	for x in /var/log/Xorg.0.log /home/*/.local/share/xorg/Xorg.0.log; do
+		grab_as_owner "$x" "$dir/$(printf '%s' "${x#/}" | tr -c 'A-Za-z0-9._-' _)"
+	done
+
+	gzip -q "$dir"/*error.txt "$dir"/*guc_log.txt "$dir/journal.txt" 2>/dev/null
+	prune
+	sync    # the user is probably about to hard-reset the box
+	log "capture done: $dir"
+}
+
+[ "$(id -u)" = 0 ] || { echo "must run as root" >&2; exit 1; }
+mkdir -p -- "$OUTDIR" && chmod 700 -- "$OUTDIR" || exit 1
+
+if [ "${1:-}" = --test ]; then
+	capture "manual test"
+	exit
+fi
+
+log "watching kernel log, saving to $OUTDIR"
+last=0
+# -n0: only new messages; restart journalctl if it ever exits
+while true; do
+	journalctl -k -f -n0 -o cat --no-pager | while IFS= read -r line; do
+		[[ $line =~ $TRIGGER ]] || continue
+		now=$(date +%s)
+		(( now - last < DEBOUNCE )) && continue
+		last=$now
+		capture "$line"
+	done
+	sleep 5
+done
