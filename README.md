@@ -100,3 +100,7 @@ sudo rm -r /var/log/gpu-hang    # optional: removes all captures
 
 See [DESIGN.md](DESIGN.md) for the reasoning behind each decision and the
 security considerations.
+
+## License
+
+[Apache License 2.0](LICENSE)
