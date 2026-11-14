@@ -18,6 +18,8 @@ TRIGGER='GPU HANG|GPU error state saved|device wedged|Failed to reset|timed out 
 DEBOUNCE=120    # seconds; one hang produces dozens of matching lines
 KEEP=20         # number of capture directories to keep
 MAXSIZE=64M     # per copied file; the i915 error state is usually a few MB
+ERROR_WAIT=120  # seconds to wait for the error state after an early trigger
+                # (forcewake warnings came 21 s before "GPU HANG" on 2026-11-14)
 
 log() { echo "gpu-hang-capture: $*"; logger -t gpu-hang-capture -- "$*" 2>/dev/null || true; }
 
@@ -46,26 +48,45 @@ prune() {
 	done
 }
 
+# true if any card currently holds a real error state; reads only a few bytes
+error_pending() {
+	local card s
+	for card in /sys/class/drm/card[0-9]; do
+		[ -e "$card/error" ] || continue
+		s=$(timeout 5 head -c 64 "$card/error" 2>/dev/null) || continue
+		[ -n "$s" ] && [[ $s != "No error state collected"* ]] && return 0
+	done
+	return 1
+}
+
+# save card*/error for every card; returns 0 if a real error state was saved
+grab_errors() {
+	local dir=$1 card name f found=1
+	for card in /sys/class/drm/card[0-9]; do
+		[ -e "$card/error" ] || continue
+		name=$(basename "$card")
+		f=$dir/$name-error.txt
+		grab "$card/error" "$f"
+		# i915 only keeps the FIRST error until cleared; clear it so the
+		# next hang is recorded too
+		if [ -s "$f" ] && ! grep -q '^No error state collected' "$f"; then
+			echo 1 > "$card/error" 2>/dev/null || true
+			found=0
+		fi
+	done
+	return $found
+}
+
 capture() {
-	local reason=$1 dir card name dbg x
+	local reason=$1 dir card name dbg x i have_error=1
 	dir=$OUTDIR/$(date +%F_%H%M%S)
 	mkdir -- "$dir" || { log "cannot create $dir"; return 1; }
 	log "trigger: $reason -> capturing to $dir"
 	printf '%s\n' "$reason" > "$dir/trigger.txt"
 
-	# give i915 a moment to finish writing the error state after "GPU HANG"
-	sleep 3
-
-	for card in /sys/class/drm/card[0-9]; do
-		[ -e "$card/error" ] || continue
-		name=$(basename "$card")
-		grab "$card/error" "$dir/$name-error.txt"
-		# i915 only keeps the FIRST error until cleared; clear it so the
-		# next hang is recorded too
-		if [ -s "$dir/$name-error.txt" ] && ! grep -q '^No error state collected' "$dir/$name-error.txt"; then
-			echo 1 > "$card/error" 2>/dev/null || true
-		fi
-	done
+	# phase 1: save everything right away, the box may die any second.
+	# The error state is only there if we triggered on "GPU HANG" itself.
+	grab_errors "$dir" && have_error=0
 
 	# debugfs has the same device under dri/0, dri/128 (render node) and
 	# dri/<pci-addr>; use the pci-addr one only
@@ -92,9 +113,31 @@ capture() {
 		grab_as_owner "$x" "$dir/$(printf '%s' "${x#/}" | tr -c 'A-Za-z0-9._-' _)"
 	done
 
-	gzip -q "$dir"/*error.txt "$dir"/*guc_log.txt "$dir/journal.txt" 2>/dev/null
+	gzip -qf "$dir"/*error.txt "$dir"/*guc_log.txt "$dir/journal.txt" 2>/dev/null
 	prune
 	sync    # the user is probably about to hard-reset the box
+
+	# phase 2: an early trigger (forcewake warnings) comes before the hang,
+	# so the error state doesn't exist yet. Wait for it, then save it and
+	# a fresh dmesg that includes the hang and the reset attempts.
+	if (( have_error )) && compgen -G '/sys/class/drm/card[0-9]/error' > /dev/null; then
+		log "no error state yet, waiting up to ${ERROR_WAIT}s for it"
+		for (( i = 0; i < ERROR_WAIT; i++ )); do
+			error_pending && break
+			sleep 1
+		done
+		if grab_errors "$dir"; then
+			log "error state appeared after ${i}s"
+			dmesg -T > "$dir/dmesg.txt" 2>&1
+			journalctl -b --since -15min --no-pager 2>&1 | gzip -c > "$dir/journal.txt.gz"
+			gzip -qf "$dir"/*error.txt 2>/dev/null
+		else
+			log "no error state within ${ERROR_WAIT}s"
+			echo "no error state appeared within ${ERROR_WAIT}s of the trigger" >> "$dir/trigger.txt"
+			rm -f -- "$dir"/*-error.txt
+		fi
+		sync
+	fi
 	log "capture done: $dir"
 }
 

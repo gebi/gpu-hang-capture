@@ -36,8 +36,15 @@ forcewake warnings so a capture starts even if the hang message never arrives.
 **Debounce of 120 s.** One hang produced about 130 matching lines within 20 s.
 One capture per incident is enough.
 
-**`sleep 3` before reading.** "GPU HANG" is logged just before the error state
-is saved. Trigger on the earliest line, then wait.
+**Two phases: save at once, then wait for the error state.** The earliest
+trigger line can come well before the hang. On 2026-11-14 the first forcewake
+warning came 21 s before "GPU HANG", so a fixed `sleep 3` read the error file
+too early and only got "No error state collected". Now phase 1 saves
+everything immediately and syncs, in case the box dies. If no error state was
+there yet, phase 2 checks the first bytes of `card*/error` once a second for
+up to `ERROR_WAIT` (120 s). When the error state shows up, phase 2 saves it
+and refreshes `dmesg.txt` and `journal.txt.gz`, so they include the hang and
+the reset attempts. If it never shows up, `trigger.txt` says so.
 
 **`timeout 15` on every read.** The device may be wedged. Reading the error
 state worked in testing, but debugfs files that touch the hardware could
