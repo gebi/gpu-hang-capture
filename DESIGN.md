@@ -42,9 +42,18 @@ warning came 21 s before "GPU HANG", so a fixed `sleep 3` read the error file
 too early and only got "No error state collected". Now phase 1 saves
 everything immediately and syncs, in case the box dies. If no error state was
 there yet, phase 2 checks the first bytes of `card*/error` once a second for
-up to `ERROR_WAIT` (120 s). When the error state shows up, phase 2 saves it
-and refreshes `dmesg.txt` and `journal.txt.gz`, so they include the hang and
-the reset attempts. If it never shows up, `trigger.txt` says so.
+up to `ERROR_WAIT` (120 s) and saves it when it shows up. If it never shows
+up, `trigger.txt` says so.
+
+**Phase 3: save the logs again after `LATE_WAIT` (30 s).** The 2026-11-18
+capture ended 1 s after "GPU HANG", so it couldn't show whether the engine
+reset worked. Phase 3 replaces `dmesg.txt` and `journal.txt.gz` with fresh
+copies. They're written to a temp file and renamed, so a freeze during the
+write keeps the earlier copy instead of leaving a truncated file.
+
+The watcher resets the debounce timer when a capture finishes. A capture can
+now take minutes, and lines from the same incident that queued up meanwhile
+would otherwise start a second capture.
 
 **`timeout 15` on every read.** The device may be wedged. Reading the error
 state worked in testing, but debugfs files that touch the hardware could

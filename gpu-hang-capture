@@ -20,6 +20,8 @@ KEEP=20         # number of capture directories to keep
 MAXSIZE=64M     # per copied file; the i915 error state is usually a few MB
 ERROR_WAIT=120  # seconds to wait for the error state after an early trigger
                 # (forcewake warnings came 21 s before "GPU HANG" on 2026-11-14)
+LATE_WAIT=30    # seconds after that to save the logs once more, to see
+                # whether the reset worked (2026-11-18 ended 1 s after the hang)
 
 log() { echo "gpu-hang-capture: $*"; logger -t gpu-hang-capture -- "$*" 2>/dev/null || true; }
 
@@ -118,8 +120,7 @@ capture() {
 	sync    # the user is probably about to hard-reset the box
 
 	# phase 2: an early trigger (forcewake warnings) comes before the hang,
-	# so the error state doesn't exist yet. Wait for it, then save it and
-	# a fresh dmesg that includes the hang and the reset attempts.
+	# so the error state doesn't exist yet. Wait for it, then save it.
 	if (( have_error )) && compgen -G '/sys/class/drm/card[0-9]/error' > /dev/null; then
 		log "no error state yet, waiting up to ${ERROR_WAIT}s for it"
 		for (( i = 0; i < ERROR_WAIT; i++ )); do
@@ -128,8 +129,6 @@ capture() {
 		done
 		if grab_errors "$dir"; then
 			log "error state appeared after ${i}s"
-			dmesg -T > "$dir/dmesg.txt" 2>&1
-			journalctl -b --since -15min --no-pager 2>&1 | gzip -c > "$dir/journal.txt.gz"
 			gzip -qf "$dir"/*error.txt 2>/dev/null
 		else
 			log "no error state within ${ERROR_WAIT}s"
@@ -138,6 +137,16 @@ capture() {
 		fi
 		sync
 	fi
+
+	# phase 3: save dmesg and the journal once more, so they show the hang
+	# and whether the reset worked. Write to a temp file and rename, so a
+	# freeze in the middle can't leave us with a truncated log.
+	log "saving logs again in ${LATE_WAIT}s"
+	sleep "$LATE_WAIT"
+	dmesg -T > "$dir/.dmesg.tmp" 2>&1 && mv -f -- "$dir/.dmesg.tmp" "$dir/dmesg.txt"
+	journalctl -b --since -15min --no-pager 2>&1 | gzip -c > "$dir/.journal.tmp" &&
+		mv -f -- "$dir/.journal.tmp" "$dir/journal.txt.gz"
+	sync
 	log "capture done: $dir"
 }
 
@@ -159,6 +168,9 @@ while true; do
 		(( now - last < DEBOUNCE )) && continue
 		last=$now
 		capture "$line"
+		# a capture can take minutes; lines of the same incident queued up
+		# meanwhile must not start a second capture
+		last=$(date +%s)
 	done
 	sleep 5
 done
